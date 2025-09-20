@@ -1,4 +1,5 @@
 （作者day-x是一个16岁的学生 因为要备战考试,所以可能无法及时回复）
+（Author day-x is a 16-year-old student who may not be able to respond promptly due to exam preparation）
 ---
 
 # BriLLM v0.15 · README (由 ChatGPT5 生成)
