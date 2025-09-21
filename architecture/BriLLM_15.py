@@ -11,6 +11,7 @@ import logging
 import io
 import re
 import random
+from collections import defaultdict
 
 jieba.re_han_default = re.compile("([\u4E00-\u9FD5a-zA-Z0-9+#&\._%<>\-]+)", re.U)
 
@@ -31,7 +32,8 @@ class BriLLMNodeBias(nn.Module):
         self.device = device
         self.d_node = d_node
         self.max_seq_len = max_seq_len
-        # self.vocab_size = vocab_size
+
+        self.amp_dtype = None
 
         ckpt = None
         if inheritance_path:
@@ -44,7 +46,6 @@ class BriLLMNodeBias(nn.Module):
                 self.d_node = ckpt["d_node"]
                 self.vocab_size = len(self.word_to_id)
                 self._init_special_ids()
-                # 如果 ckpt 里保存了 max_seq_len，可覆盖（可选）
                 if "max_seq_len" in ckpt:
                     self.max_seq_len = int(ckpt["max_seq_len"])
 
@@ -65,7 +66,7 @@ class BriLLMNodeBias(nn.Module):
                 else:
                     raise ValueError(f"模型:{inheritance_path} 未找到")
         else:
-            # 2) 正常按给定数据构建词表/数据/边
+            # 正常按给定数据构建词表/数据/边
             self.word_to_id, self.id_to_word = self.participle(l_dataset[0])
             self.dataset_id = self.process_data(l_dataset[0])
             self.vocab_size = len(self.word_to_id)
@@ -73,39 +74,42 @@ class BriLLMNodeBias(nn.Module):
 
         edge2id_size = len(self.edge2id)
 
+        # 参数
         self.bias_table = nn.Parameter(torch.empty(self.vocab_size, self.d_node).uniform_(-0.5, 0.5))
-
         self.W = nn.Parameter(torch.empty(edge2id_size, self.d_node, self.d_node).uniform_(-0.5, 0.5))
         self.bias = nn.Parameter(torch.empty(edge2id_size, self.d_node).uniform_(-0.5, 0.5))
-
         self.W_shared = nn.Parameter(torch.empty(self.d_node, self.d_node).uniform_(-0.5, 0.5))
         self.bias_shared = nn.Parameter(torch.empty(self.d_node).uniform_(-0.5, 0.5))
-
         self.a = nn.Parameter(torch.ones(1, self.max_seq_len, 1))
-
         self.gate = nn.Parameter(torch.tensor(0.1))
         self.pe_scale = nn.Parameter(torch.tensor(0.5))
 
+        # PE cache
         self.register_buffer("PE_cache", self.get_positional_encoding(self.max_seq_len, self.d_node)[0])
+
+        # 邻接缓存（在 auto_create_edge 里只在 CPU 构建为 LongTensor，这里迁移到 device）
+        self._build_adj_cache_from_edge2id()  # 构建 self.adj_true_ids / self.adj_eidx (CPU)
+
+        # eid_table（保持兼容）
         self.eid_table = self.build_lastid_to_eid_table()
-        # self.register_buffer("eid_table", self.build_lastid_to_eid_table())
 
         # 4) 如果有 ckpt，加载权重 + 词表/边
         if ckpt is not None:
             missing, unexpected = self._safe_load_state_dict(ckpt["model_state_dict"])
-            # 覆盖词典和边（再次保证一致）
             self.word_to_id = ckpt["word_to_id"]
             self.id_to_word = ckpt["id_to_word"]
             self.edge2id = ckpt["edge2id"]
-            # 重建 eid_table（基于 ckpt 的 edge2id）
             self.eid_table = self.build_lastid_to_eid_table()
-            # self.register_buffer("eid_table", self.build_lastid_to_eid_table())
+            self._build_adj_cache_from_edge2id()  # 重新构建邻接缓存（CPU）
             if missing or unexpected:
                 print(f"[load] missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
-        # self.edge2id_len = None
+
         print(f"V: {self.vocab_size}")
-        # print(self.edge2id)
         self.to(self.device)
+
+        self._W_pool = None
+        self._b_pool = None
+        self._pool_version = -1
 
     def _safe_load_state_dict(self, state_dict):
         own = self.state_dict()
@@ -120,12 +124,27 @@ class BriLLMNodeBias(nn.Module):
         return missing, unexpected
 
     def _init_special_ids(self):
-        # 如果词表里没有，就给出默认回退值，避免 KeyError
         self.BOS_id = self.word_to_id.get('<BOS>', 0)
         self.END_id = self.word_to_id.get('<END>', 1)
         self.EOS_id = self.word_to_id.get('<EOS>', 2)
         self.UNK_id = self.word_to_id.get('<UNK>', 3)
 
+    def _refresh_pools(self):
+        self._W_pool = torch.cat([self.W, self.W_shared.unsqueeze(0)], dim=0)
+        self._b_pool = torch.cat([self.bias, self.bias_shared.unsqueeze(0)], dim=0)
+
+    def _get_pools(self):
+        self._refresh_pools()
+        return self._W_pool, self._b_pool
+
+    def enable_compile(self, mode="reduce-overhead"):
+        try:
+            self.forward = torch.compile(self.forward, mode=mode, fullgraph=False)
+            print(f"[compile] enabled: mode={mode}")
+        except Exception as e:
+            print(f"[compile] skipped: {e}")
+
+    # ---------- 预测 ----------
     def _top_k_filter_logits(self, logits: torch.Tensor, k: int):
         if (k is None) or (k <= 0) or (k >= logits.numel()):
             return logits
@@ -137,21 +156,14 @@ class BriLLMNodeBias(nn.Module):
     def _top_p_filter_logits(self, logits: torch.Tensor, p: float):
         if (p is None) or (p <= 0.0) or (p >= 1.0):
             return logits
-        # 排序（大->小）
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         probs = F.softmax(sorted_logits, dim=-1)
         cumprobs = torch.cumsum(probs, dim=-1)
-
-        # 保留累计概率 <= p 的 token（再确保至少保留一个）
         keep = cumprobs <= p
         if not torch.any(keep):
-            keep[0] = True  # 至少留一个
-
-        # 把不保留的 logits 设为 -inf
+            keep[0] = True
         filtered = torch.full_like(sorted_logits, float('-inf'))
         filtered[keep] = sorted_logits[keep]
-
-        # 还原到原索引位置
         restored = torch.full_like(logits, float('-inf'))
         restored.scatter_(0, sorted_indices, filtered)
         return restored
@@ -177,18 +189,14 @@ class BriLLMNodeBias(nn.Module):
         Edge = []
         for i in range(max_len):
             out = self.forward(ids)
-
             logits = out['logits']
 
             if sample and (temperature != 1.0 or top_k or top_p):
                 logits_f = self._top_p_filter_logits(logits, top_p)
                 logits_f = self._top_k_filter_logits(logits_f, top_k)
-
                 probs = F.softmax(logits_f, dim=-1)
-
                 if not torch.isfinite(probs).any():
                     probs = out['probs']
-
                 next_id = torch.multinomial(probs, 1).item()
             else:
                 probs = out['probs']
@@ -199,16 +207,12 @@ class BriLLMNodeBias(nn.Module):
                 Edge.append(self.ids_to_words([(ids[-1], next_id)]))
             ids.append(next_id)
             yield self.ids_to_words([next_id])[0], i
-            # if i == max_len - 1:
-            # print(f"输出不存在的边数量: {notInEdge}")
-            # print(f"边:{Edge}")
             if next_id == self.END_id:
-                # print(f"输出不存在的边数量: {notInEdge}")
-                # print(f"边:{Edge}")
                 break
 
+    # ---------- 词表/数据/边 ----------
     def build_lastid_to_eid_table(self):
-        # 不再生成 (V,V)，而是直接存一个 dict
+        # 兼容保留（不在热路径使用）
         return {(u, v): eidx for (u, v), eidx in self.edge2id.items()}
 
     def get_positional_encoding(self, seq_len, d_model):
@@ -221,36 +225,41 @@ class BriLLMNodeBias(nn.Module):
 
     def auto_create_edge(self, dataset, minimum=-1):
         print(f"[处理边...]")
-        # 统计频率
         edges = {}
         for i in range(len(dataset)):
-            # 从下标1开始 去头
             jv = dataset[i][0] + dataset[i][1]
             for j in range(1, len(jv)):
                 if j + 1 < len(jv):
-                    if (jv[j], jv[j + 1]) not in edges:
-                        edges[(jv[j], jv[j + 1])] = 1
-                    else:
-                        edges[(jv[j], jv[j + 1])] += 1
+                    e = (jv[j], jv[j + 1])
+                    edges[e] = edges.get(e, 0) + 1
         edge2id = {}
         allFrequencies = {}
         print(f"总边数量: {len(edges)}")
-        for i in zip(edges.keys(), edges.values()):
-            id1 = i[0][0]
-            id2 = i[0][1]
-            freq = i[1]
-            if id1 not in allFrequencies:
-                allFrequencies[id1] = [{id2: (len(edge2id), freq)}]
-            elif id1 in allFrequencies:
-                allFrequencies[id1].append({id2: (len(edge2id), freq)})
-            if i[1] > minimum:
-                edge2id[i[0]] = len(edge2id)
+        for (u, v), freq in zip(edges.keys(), edges.values()):
+            if u not in allFrequencies:
+                allFrequencies[u] = [{v: (len(edge2id), freq)}]
+            else:
+                allFrequencies[u].append({v: (len(edge2id), freq)})
+            if freq > minimum:
+                edge2id[(u, v)] = len(edge2id)
         self.edges = edges
-        if minimum and minimum != -1: print(f"处理后的数量: {len(edge2id)}")
-        # self.edge_len = len(edge2id)
-        # print(allFrequencies)
+        if minimum and minimum != -1:
+            print(f"处理后的数量: {len(edge2id)}")
         self.edge_freq = allFrequencies
         return edge2id
+
+    def _build_adj_cache_from_edge2id(self):
+        """基于 self.edge2id 构建邻接缓存（CPU Float/Long Tensor），在 .to() 里搬到目标设备"""
+        tmp_vs = defaultdict(list)
+        tmp_eid = defaultdict(list)
+        for (u, v), eidx in self.edge2id.items():
+            tmp_vs[u].append(v)
+            tmp_eid[u].append(eidx)
+        self.adj_true_ids = {}
+        self.adj_eidx = {}
+        for u in tmp_vs:
+            self.adj_true_ids[u] = torch.tensor(tmp_vs[u], dtype=torch.long)
+            self.adj_eidx[u] = torch.tensor(tmp_eid[u], dtype=torch.long)
 
     def words_to_ids(self, words):
         ids: list[int] = []
@@ -295,24 +304,20 @@ class BriLLMNodeBias(nn.Module):
         print("[处理数据...]", end='')
         for words in tqdm(range(len(texts))):
             q = self.words_to_ids(texts[words]['query'])
-            q.insert(0, 0)  # <SOS>
-            q.append(2)  # <EOS>
+            q.insert(0, 0)  # <BOS>
+            q.append(2)     # <EOS>
 
-            # Answer + <END>
             a = self.words_to_ids(texts[words]['answer'])
-            # a = a[:max_answer_len]  # 截断到最大长度
             a.append(1)  # <END>
 
             dataset.append((q, a))
         num = 0
         for i in dataset:
-            for _ in i[0]:
-                num += 1
-            for _ in i[1]:
-                num += 1
+            num += len(i[0]) + len(i[1])
         print(f"->[数据token数量: {num}]")
         return dataset
 
+    # ---------- 权重访问 ----------
     def get_bias(self, id1, id2):
         eid = self.edge2id.get((id1, id2), None)
         if eid is None:
@@ -326,13 +331,10 @@ class BriLLMNodeBias(nn.Module):
         return self.W[eid]
 
     def get_edge_next(self, id1, k=None):
-        # {id: (位置, 频率)}
         if id1 in self.edge_freq:
             ids = []
             if k:
                 for i in self.edge_freq[id1]:
-                    # print(i)
-                    # ids.extend(list(i.keys()))
                     if list(i.values())[1] < k:
                         continue
                     ids.append(i)
@@ -345,16 +347,15 @@ class BriLLMNodeBias(nn.Module):
     def get_edge_next_d_node(self, id1):
         W = []
         b = []
-        id = []
+        idv = []
         if id1 in self.edge_freq:
             for i in self.edge_freq[id1]:
-                # print(list(i.values())[0][0])
                 W.append(self.W[list(i.values())[0][0]])
                 b.append(self.bias[list(i.values())[0][0]])
-                id.append(list(i.keys())[0])
-            return torch.stack(W), torch.stack(b), id
+                idv.append(list(i.keys())[0])
+            return torch.stack(W), torch.stack(b), idv
         else:
-            return torch.stack([self.W_shared]), torch.stack([self.bias_shared]), id
+            return torch.stack([self.W_shared]), torch.stack([self.bias_shared]), idv
 
     def _forward_one(self, token_ids: list | torch.Tensor):
         if isinstance(token_ids, torch.Tensor):
@@ -363,25 +364,23 @@ class BriLLMNodeBias(nn.Module):
             raise ValueError("token_ids 不能为空")
 
         L = len(token_ids)
-
         if L > self.max_seq_len:
             token_ids = token_ids[:self.max_seq_len]
             L = self.max_seq_len
 
         e = []
-
         PE = self.PE_cache[:L]
         h0 = self.bias_table[token_ids] + self.pe_scale * PE
 
         for i in range(L):
-            id = token_ids[i]
+            tid = token_ids[i]
             if i > 0:
                 previousId = token_ids[i - 1]
                 prev_state = self.gate * e[i - 1] + (1 - self.gate) * h0[i - 1]
                 base = F.layer_norm(prev_state, (self.d_node,))
                 x = F.gelu(
-                    self.get_w(previousId, id) @ base +
-                    self.get_bias(previousId, id) +
+                    self.get_w(previousId, tid) @ base +
+                    self.get_bias(previousId, tid) +
                     PE[i]
                 )
                 e.append(prev_state + x)
@@ -389,25 +388,28 @@ class BriLLMNodeBias(nn.Module):
                 base0 = h0[i]
                 x0 = F.gelu(base0)
                 e.append(base0 + x0)
+
         e = torch.stack(e, dim=0).to(self.device)
         A = F.softmax(self.a[:, :L, :], dim=1)
         E = torch.sum(A * e.unsqueeze(0), dim=1)
         lastId = token_ids[-1]
 
-        Wb_W, Wb_b, true_id = self.get_edge_next_d_node(lastId)
-
+        W_pool, b_pool = self._get_pools()
         dev = E.device
         dt = E.dtype
 
-        Wb_W = Wb_W.to(dev, dtype=dt).contiguous()
-        Wb_b = Wb_b.to(dev, dtype=dt).contiguous()
-        true_id = torch.as_tensor(true_id, device=dev, dtype=torch.long)
-
-        W_shared = self.W_shared.to(dev, dtype=dt).unsqueeze(0).contiguous()
-        b_shared = self.bias_shared.to(dev, dtype=dt).unsqueeze(0).contiguous()
-
-        W_all = torch.cat([Wb_W, W_shared], dim=0).contiguous()
-        b_all = torch.cat([Wb_b, b_shared], dim=0).contiguous()
+        if lastId in self.adj_true_ids:
+            true_id = self.adj_true_ids[lastId]
+            eid_true = self.adj_eidx[lastId]
+            W_true = self.W[eid_true].to(dev, dtype=dt).contiguous()
+            b_true = self.bias[eid_true].to(dev, dtype=dt).contiguous()
+            W_all = torch.cat([W_true, self.W_shared.unsqueeze(0).to(dev, dtype=dt)], dim=0).contiguous()
+            b_all = torch.cat([b_true, self.bias_shared.unsqueeze(0).to(dev, dtype=dt)], dim=0).contiguous()
+            true_id = true_id.to(dev)
+        else:
+            W_all = self.W_shared.unsqueeze(0).to(dev, dtype=dt)
+            b_all = self.bias_shared.unsqueeze(0).to(dev, dtype=dt)
+            true_id = torch.empty(0, dtype=torch.long, device=dev)
 
         E_vec = E.squeeze(0).to(dev, dtype=dt).contiguous()
         PE_last = PE[L - 1].to(dev, dtype=dt)
@@ -424,20 +426,18 @@ class BriLLMNodeBias(nn.Module):
             y_all[true_id] = y[:-1]
 
         v_predict = y_all.norm(p=2, dim=1)
-        temperature = 1.0
-        logits = v_predict / max(temperature, 1e-6)
-        logits = logits - logits.max()
+        logits = v_predict - v_predict.max()
         return logits
 
     def get_eid_row(self, lastId):
-        row = torch.full((self.vocab_size,), self.W.shape[0], dtype=torch.long)  # 默认 unknown
+        row = torch.full((self.vocab_size,), self.W.shape[0], dtype=torch.long)
         for (u, v), eidx in self.edge2id.items():
             if u == lastId:
                 row[v] = eidx
         return row
 
+    # ---------- Forward（批） ----------
     def _forward_batch(self, batch_token_ids):
-        global W_true, b_true
         device = self.device
         pad_id = getattr(self, "pad_id", 0)
 
@@ -470,14 +470,11 @@ class BriLLMNodeBias(nn.Module):
         PE = self.PE_cache[:L_max].to(device)
         h0 = self.bias_table[token_tensor] + self.pe_scale * PE.unsqueeze(0)
 
-        # e_0
         base0 = h0[:, 0, :]
         e0 = base0 + F.gelu(base0)
-
         e_list = [e0]
 
-        W_pool = torch.cat([self.W, self.W_shared.unsqueeze(0)], dim=0)
-        b_pool = torch.cat([self.bias, self.bias_shared.unsqueeze(0)], dim=0)
+        W_pool, b_pool = self._get_pools()
 
         for i in range(1, L_max):
             prev_state = self.gate * e_list[i - 1] + (1.0 - self.gate) * h0[:, i - 1, :]
@@ -492,8 +489,8 @@ class BriLLMNodeBias(nn.Module):
             ]
             eid_batch = torch.tensor(eid_batch, device=self.device, dtype=torch.long)
 
-            W = W_pool[eid_batch]
-            b = b_pool[eid_batch]
+            W = torch.cat([self.W, self.W_shared.unsqueeze(0)], dim=0)[eid_batch]
+            b = torch.cat([self.bias, self.bias_shared.unsqueeze(0)], dim=0)[eid_batch]
 
             Wx = torch.bmm(W, base.unsqueeze(-1)).squeeze(-1)
             x = F.gelu(Wx + b + PE[i].unsqueeze(0))
@@ -515,32 +512,29 @@ class BriLLMNodeBias(nn.Module):
         last_ids = token_tensor.gather(1, last_indices.view(B, 1)).squeeze(1)
 
         logits_out = []
-        E_len = self.W.shape[0]
         dev = E.device
         dt = E.dtype
 
         for b_idx in range(B):
             lastId = int(last_ids[b_idx].item())
-            eid_full = self.get_eid_row(lastId)
-            eid_full = eid_full.to(dev)
 
-            true_mask = (eid_full != E_len)
-            true_id = true_mask.nonzero(as_tuple=False).squeeze(1)
-            K = true_id.numel()
+            if lastId in self.adj_true_ids:
+                true_id = self.adj_true_ids[lastId]
+                eid_true = self.adj_eidx[lastId]
 
-            if K > 0:
-                eid_true = eid_full[true_id]
                 W_true = self.W[eid_true].to(dev, dtype=dt).contiguous()
                 b_true = self.bias[eid_true].to(dev, dtype=dt).contiguous()
-            W_unk = self.W_shared.to(dev, dtype=dt).unsqueeze(0).contiguous()
-            b_unk = self.bias_shared.to(dev, dtype=dt).unsqueeze(0).contiguous()
+                W_unk = self.W_shared.to(dev, dtype=dt).unsqueeze(0).contiguous()
+                b_unk = self.bias_shared.to(dev, dtype=dt).unsqueeze(0).contiguous()
 
-            if K > 0:
                 W_all_small = torch.cat([W_true, W_unk], dim=0).contiguous()
                 b_all_small = torch.cat([b_true, b_unk], dim=0).contiguous()
+
+                true_id = true_id.to(dev)
             else:
-                W_all_small = W_unk
-                b_all_small = b_unk
+                W_all_small = self.W_shared.to(dev, dtype=dt).unsqueeze(0).contiguous()
+                b_all_small = self.bias_shared.to(dev, dtype=dt).unsqueeze(0).contiguous()
+                true_id = torch.empty(0, dtype=torch.long, device=dev)
 
             E_vec = E[b_idx].to(dev, dtype=dt).contiguous()
             PE_last = PE[last_indices[b_idx]].to(dev, dtype=dt)
@@ -551,7 +545,7 @@ class BriLLMNodeBias(nn.Module):
             y_unk = y_small[-1]
             y_all = y_small.new_empty(self.vocab_size, self.d_node)
             y_all[:] = y_unk
-            if K > 0:
+            if true_id.numel() > 0:
                 y_all[true_id] = y_small[:-1]
 
             v_predict = y_all.norm(p=2, dim=1)
@@ -560,30 +554,23 @@ class BriLLMNodeBias(nn.Module):
 
         return torch.stack(logits_out, dim=0)
 
+    # ---------- forward 接口 ----------
     def forward(self, token_ids: list):
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.tolist()
 
+        # 批
         if isinstance(token_ids, list) and len(token_ids) > 0 and isinstance(token_ids[0], (list, tuple)):
             logits = self._forward_batch(list(token_ids))
             probs = F.softmax(logits, dim=1)
-            return {
-                "logits": logits,
-                "probs": probs,
-                # "pred_id": pred,
-                "loss": None
-            }
+            return {"logits": logits, "probs": probs, "loss": None}
 
+        # 单样本
         logits = self._forward_one(list(token_ids))
         probs = F.softmax(logits, dim=-1)
-        # pred = torch.argmax(logits).item()
-        return {
-            "logits": logits,
-            "probs": probs,
-            # "pred_id": pred,
-            "loss": None
-        }
+        return {"logits": logits, "probs": probs, "loss": None}
 
+    # ---------- 训练 ----------
     def train_model(self, epochs, dataset=None, save_model_path=None, batch=None, use_mixed_precision=False, lr=0.0015,
                     precision_dtype=None, max_auto_batch=-1, stop_loss=1e-3, use_temp_best=False, disrupt=False):
         """
@@ -598,19 +585,22 @@ class BriLLMNodeBias(nn.Module):
         :param stop_loss: 停止 loss
         :param use_temp_best: 变量保存最有模型
         :param disrupt: 打乱数据集
-        :return:
         """
         global batchDataset, batchY, scaler, best_loss
         if save_model_path:
-            best_loss = float("inf")  # 初始为正无穷
+            best_loss = float("inf")
 
         self.train()
         if not dataset:
-            # print(f"train_model->dataset:None->>[使用默认数据]")
             dataset = self.dataset_id
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        try:
+            optimizer = torch.optim.AdamW(self.parameters(), lr=lr, fused=True)
+        except TypeError:
+            optimizer = torch.optim.AdamW(self.parameters(), lr=lr)
+
         criterion = nn.CrossEntropyLoss()
+
         if use_mixed_precision:
             cc_major, cc_minor = torch.cuda.get_device_capability()
             if cc_major < 7 and use_mixed_precision != 'all':
@@ -619,57 +609,40 @@ class BriLLMNodeBias(nn.Module):
                 if (cc_major, cc_minor) == (7, 0):
                     precision_dtype = torch.float16
                 else:
-                    if torch.cuda.is_bf16_supported():
-                        precision_dtype = torch.bfloat16
-                    else:
-                        precision_dtype = torch.float16
-
+                    precision_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            self.amp_dtype = precision_dtype
             scaler = torch.amp.GradScaler(device="cuda")
-        # print(precision_dtype)
 
         isBatch = batch == "auto" or (batch is not None and batch > 1)
 
         if disrupt:
             random.shuffle(dataset)
             if batch == "auto":
-                print(f"提示："
-                      f"我们不推荐您同时使用batch和disrupt."
-                      f"auto推荐您在小规模训练时使用")
+                print("提示：我们不推荐您同时使用batch和disrupt. auto推荐您在小规模训练时使用")
 
         if isBatch:
             batchDataset = []
             batchY = []
             print(f"[处理batch数据]")
             for i in range(len(dataset)):
-                if isBatch:
-                    q, a = dataset[i]
-                    prefixes = [q + a[:j] for j in range(len(a))]
-                    targets = torch.tensor(a, dtype=torch.long, device=self.device)
-                    for j in range(len(prefixes)):
-                        batchDataset.append(
-                            prefixes[j]
-                        )
-                        batchY.append(
-                            targets[j]
-                        )
-                if len(batchDataset) != len(batchY):
-                    raise ValueError(
-                        f"[错误] batchDataset({len(batchDataset)}) 与 batchY({len(batchY)}) 长度不一致，"
-                        "请检查数据处理逻辑。"
-                    )
+                q, a = dataset[i]
+                prefixes = [q + a[:j] for j in range(len(a))]
+                targets = a
+                for j in range(len(prefixes)):
+                    batchDataset.append(prefixes[j])
+                    batchY.append(targets[j])
+            if len(batchDataset) != len(batchY):
+                raise ValueError(f"[错误] batchDataset({len(batchDataset)}) 与 batchY({len(batchY)}) 长度不一致")
         elif use_mixed_precision:
-            raise ValueError(
-                f"[错误] 当前模式(无batch)不支持混合精度"
-            )
+            raise ValueError("[错误] 当前模式(无batch)不支持混合精度")
+
+        # 训练
         for epoch in range(epochs):
             startTime = time.time()
             lossItem = None
+
             if isBatch:
                 def _for_batch(batch_x, batch_t):
-                    """
-                    动态批处理：尽量用大批次训练；若显存不足触发 CUDA OOM，则对当前子批次二分，
-                    直到能跑或无法再分。返回最后一次成功子批的 loss。
-                    """
                     assert len(batch_x) == len(batch_t)
                     n = len(batch_x)
                     start = 0
@@ -678,10 +651,10 @@ class BriLLMNodeBias(nn.Module):
                     def _try_run(x, t):
                         optimizer.zero_grad(set_to_none=True)
                         if use_mixed_precision:
-                            with torch.amp.autocast(device_type="cuda", dtype=precision_dtype):
+                            with torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype):
                                 out = self.forward(x)
                                 logits = out["logits"]
-                                targets = torch.tensor(t, dtype=torch.long, device=logits.device)  # [B]
+                                targets = torch.tensor(t, dtype=torch.long, device=logits.device)
                                 loss = criterion(logits, targets)
                             scaler.scale(loss).backward()
                             scaler.step(optimizer)
@@ -701,8 +674,8 @@ class BriLLMNodeBias(nn.Module):
                             try:
                                 if end <= start:
                                     raise RuntimeError("Empty sub-batch during dynamic split")
-                                sub_x = batch_x[start:end]
-                                sub_t = batch_t[start:end]
+                                sub_x = x = batch_x[start:end]
+                                sub_t = t = batch_t[start:end]
                                 last_loss = _try_run(sub_x, sub_t)
                                 start = end
                                 break
@@ -717,7 +690,6 @@ class BriLLMNodeBias(nn.Module):
                                     end = new_end
                                     continue
                                 else:
-                                    # 非 OOM 错误：直接抛出
                                     raise
                     return last_loss
 
@@ -732,10 +704,10 @@ class BriLLMNodeBias(nn.Module):
                                 batch_t = a[s: s + max_auto_batch]
                                 lossItem = _for_batch(batch_x, batch_t)
                         else:
-                            batch_x = batchDataset[i:i + L]
-                            batch_t = batchY[i:i + L]
+                            offset = sum(len(dataset[k][1]) for k in range(i))
+                            batch_x = batchDataset[offset: offset + L]
+                            batch_t = batchY[offset: offset + L]
                             lossItem = _for_batch(batch_x, batch_t)
-
                 else:
                     for i in tqdm(range(0, len(batchDataset), batch)):
                         batch_x = batchDataset[i:i + batch]
@@ -744,29 +716,24 @@ class BriLLMNodeBias(nn.Module):
 
             else:
                 for i in tqdm(range(len(dataset))):
-                    for j in range(len(dataset[i][1])):
-                        x = dataset[i][0] + dataset[i][1][:j]
-                        y = dataset[i][1][j]
-
-                        # out = model(x)
+                    q, a = dataset[i]
+                    for j in range(len(a)):
+                        x = q + a[:j]
+                        y = a[j]
                         out = self.forward(x)
-                        logits = out["logits"]
-                        logits = logits.unsqueeze(0)
-
+                        logits = out["logits"].unsqueeze(0)
                         target = torch.tensor([y], dtype=torch.long, device=logits.device)
-
                         loss = criterion(logits, target)
                         loss.backward()
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
                     lossItem = loss.item()
-            if use_temp_best:  # 保存最优模型
-                self.temp_best_checkpoint = {
-                    k: v.detach().cpu().clone() for k, v in self.state_dict().items()
-                }
+
+            if use_temp_best:
+                self.temp_best_checkpoint = {k: v.detach().cpu().clone() for k, v in self.state_dict().items()}
+
             if save_model_path:
-                if lossItem and lossItem < best_loss:
-                    #  if loss.item() < best_loss:
+                if lossItem is not None and lossItem < best_loss:
                     best_loss = lossItem
                     self.save_model(
                         path=save_model_path,
@@ -775,14 +742,14 @@ class BriLLMNodeBias(nn.Module):
                         loss=lossItem,
                     )
                     print(f"🔥 新最佳模型已保存 (loss={best_loss:.6f})")
-            if (epoch + 1) % 1 == 0:
-                print(f"Epoch {epoch + 1}/{epochs}, Loss: {lossItem:.6f}, "
-                      f"Time: {time.time() - startTime:.2f}s")
 
-            break_loss = stop_loss
-            if lossItem <= break_loss:
-                print(f"低于:{break_loss},自动退出")
+            if (epoch + 1) % 1 == 0:
+                print(f"Epoch {epoch + 1}/{epochs}, Loss: {lossItem:.6f}, Time: {time.time() - startTime:.2f}s")
+
+            if lossItem <= stop_loss:
+                print(f"低于:{stop_loss},自动退出")
                 break
+
         if save_model_path:
             print(f"自动保存模型Loss: {best_loss:.6f}")
 
@@ -794,13 +761,10 @@ class BriLLMNodeBias(nn.Module):
             "word_to_id": self.word_to_id,
             "id_to_word": self.id_to_word,
             "edge2id": self.edge2id,
+            "max_seq_len": self.max_seq_len,
         }
         if optimizer:
-            # 兼容 dict 或 优化器对象
-            if isinstance(optimizer, dict):
-                ckpt["optimizer_state_dict"] = optimizer
-            else:
-                ckpt["optimizer_state_dict"] = optimizer.state_dict()
+            ckpt["optimizer_state_dict"] = optimizer if isinstance(optimizer, dict) else optimizer.state_dict()
         if epoch is not None:
             ckpt["epoch"] = epoch
         if loss is not None:
@@ -844,6 +808,17 @@ class BriLLMNodeBias(nn.Module):
             model.id_to_word = ckpt["id_to_word"]
             model.edge2id = ckpt["edge2id"]
             model._init_special_ids()
-            model.register_buffer("eid_table", model.build_lastid_to_eid_table())
+            model._build_adj_cache_from_edge2id()
+            model.eid_table = model.build_lastid_to_eid_table()
 
         return model, ckpt
+
+    def to(self, device):
+        super().to(device)
+        self.device = device
+        if hasattr(self, "adj_true_ids"):
+            for k in list(self.adj_true_ids.keys()):
+                self.adj_true_ids[k] = self.adj_true_ids[k].to(device)
+                self.adj_eidx[k] = self.adj_eidx[k].to(device)
+        self._refresh_pools()
+        return self
